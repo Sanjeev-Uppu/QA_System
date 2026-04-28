@@ -136,22 +136,36 @@ def load_index():
 
 # -------- ASK QUESTION --------
 def ask_question(index, question):
-    if index is None:
-        return "❌ Qdrant not connected."
 
-    # 🔥 Better retrieval
+    if index is None:
+        return {
+            "answer": "❌ Qdrant not connected.",
+            "sources": [],
+            "chunks": []
+        }
+
     retriever = index.as_retriever(similarity_top_k=5)
     nodes = retriever.retrieve(question)
 
-    # 🔥 If nothing retrieved → fallback immediately
+    # ❌ No context → fallback
     if not nodes:
-        return ask_from_external_knowledge(question)
+        ext = ask_from_external_knowledge(question)
+        return {
+            "answer": ext,
+            "sources": ["External Knowledge"],
+            "chunks": []
+        }
 
     context = "\n\n".join(n.text for n in nodes)
 
-    # 🔥 Weak context detection
+    # ❌ Weak context → fallback
     if len(context.strip()) < 50:
-        return ask_from_external_knowledge(question)
+        ext = ask_from_external_knowledge(question)
+        return {
+            "answer": ext,
+            "sources": ["External Knowledge"],
+            "chunks": []
+        }
 
     sources = list(set(
         n.metadata.get("chapter")
@@ -159,9 +173,6 @@ def ask_question(index, question):
         if n.metadata.get("chapter")
     ))
 
-    sources_text = "\n".join(f"📘 {s}" for s in sources)
-
-    # 🔥 STRICT RAG PROMPT
     prompt = f"""
 You are a strict AI assistant.
 
@@ -182,13 +193,23 @@ Answer:
 
     answer = generate_with_retry(prompt)
 
-    # 🔥 If model still unsure → fallback
+    # ❌ Model unsure → fallback
     if not answer or "i don't know" in answer.lower():
-        return ask_from_external_knowledge(question)
+        ext = ask_from_external_knowledge(question)
+        return {
+            "answer": ext,
+            "sources": ["External Knowledge"],
+            "chunks": []
+        }
 
-    return f"{answer}\n\n---\n📚 Sources:\n{sources_text}\n\nℹ️ Answer derived from provided documents."
+    # ✅ FINAL RETURN (IMPORTANT)
+    return {
+        "answer": answer,
+        "sources": sources,
+        "chunks": [n.text for n in nodes]
+    }
 
-# -------- EXTERNAL KNOWLEDGE FALLBACK --------
+# -------- EXTERNAL KNOWLEDGE --------
 def ask_from_external_knowledge(question):
     prompt = f"""
 Answer the question clearly using general knowledge.
@@ -201,4 +222,4 @@ Answer:
 
     answer = generate_with_retry(prompt)
 
-    return f"{answer}\n\n---\n🌍 Source: External Knowledge (No relevant context found)"
+    return answer if answer else "⚠️ API quota exceeded. Please try again later"
