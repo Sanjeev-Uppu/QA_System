@@ -1,72 +1,204 @@
-# utils/qa_engine.py
-
 import os
+import time
+import fitz  # PyMuPDF
 from dotenv import load_dotenv
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
-from utils.embeddings import get_embedding_model
-import google.generativeai as genai
 
-# ---------- Load environment ----------
+from llama_index.core import VectorStoreIndex, StorageContext, Document
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.core.node_parser import SimpleNodeParser
+from qdrant_client import QdrantClient
+
+from utils.embeddings import get_embedding_model
+from google import genai
+
+# -------- LOAD ENV --------
 load_dotenv()
 
-API_KEY = os.getenv("GOOGLE_API_KEY")
-if not API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY not found")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-# ---------- Configure Gemini ----------
-genai.configure(api_key=API_KEY)
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
-# Use supported model
-MODEL_NAME = "gemini-1.5-flash"
+# -------- QDRANT CLIENT --------
+def get_qdrant_client():
+    return QdrantClient(
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+        timeout=120,
+        prefer_grpc=False
+    )
 
+# -------- PDF EXTRACTION --------
+def extract_text_from_pdf(file_path):
+    doc = fitz.open(file_path)
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
 
-# ---------- Build index ----------
-def build_index_from_pdf(pdf_path):
-    documents = SimpleDirectoryReader(
-        input_files=[pdf_path]
-    ).load_data()
+def load_documents(folder):
+    documents = []
 
-    return VectorStoreIndex.from_documents(
-        documents,
+    for file in os.listdir(folder):
+        if file.endswith(".pdf"):
+            path = os.path.join(folder, file)
+
+            text = extract_text_from_pdf(path)
+
+            if not text.strip():
+                print(f"⚠️ Empty file skipped: {file}")
+                continue
+
+            documents.append(
+                Document(
+                    text=text,
+                    metadata={
+                        "chapter": file.replace(".pdf", "")
+                    }
+                )
+            )
+
+            print(f"✅ Loaded: {file} | chars={len(text)}")
+
+    return documents
+
+# -------- GEMINI RETRY --------
+def generate_with_retry(prompt):
+    models = [
+        "models/gemini-2.5-flash",
+        "models/gemini-2.0-flash"
+    ]
+
+    for model in models:
+        for _ in range(3):
+            try:
+                res = client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+                return res.text
+            except Exception as e:
+                print(f"⚠️ {model} failed: {e}")
+                time.sleep(2)
+
+    return None
+
+# -------- BUILD INDEX --------
+def build_index():
+    print("📄 Loading PDFs...")
+
+    documents = load_documents("data/pdfs")
+
+    parser = SimpleNodeParser.from_defaults(
+        chunk_size=512,
+        chunk_overlap=50
+    )
+
+    nodes = parser.get_nodes_from_documents(documents)
+    print(f"🧩 Nodes: {len(nodes)}")
+
+    qdrant_client = get_qdrant_client()
+
+    vector_store = QdrantVectorStore(
+        client=qdrant_client,
+        collection_name="rag_collection"
+    )
+
+    storage = StorageContext.from_defaults(vector_store=vector_store)
+
+    VectorStoreIndex(
+        nodes,
+        storage_context=storage,
         embed_model=get_embedding_model()
     )
 
+    print("✅ Index built!")
 
-# ---------- PDF Q&A ----------
+# -------- LOAD INDEX --------
+def load_index():
+    try:
+        qdrant_client = get_qdrant_client()
+
+        vector_store = QdrantVectorStore(
+            client=qdrant_client,
+            collection_name="rag_collection"
+        )
+
+        return VectorStoreIndex.from_vector_store(
+            vector_store,
+            embed_model=get_embedding_model()
+        )
+
+    except Exception as e:
+        print("❌ Qdrant connection failed:", e)
+        return None
+
+# -------- ASK QUESTION --------
 def ask_question(index, question):
-    retriever = index.as_retriever(similarity_top_k=3)
+    if index is None:
+        return "❌ Qdrant not connected."
+
+    # 🔥 Better retrieval
+    retriever = index.as_retriever(similarity_top_k=5)
     nodes = retriever.retrieve(question)
 
+    # 🔥 If nothing retrieved → fallback immediately
     if not nodes:
-        return "I don't know based on the provided document."
+        return ask_from_external_knowledge(question)
 
-    context = "\n\n".join(n.text[:1000] for n in nodes)
+    context = "\n\n".join(n.text for n in nodes)
 
+    # 🔥 Weak context detection
+    if len(context.strip()) < 50:
+        return ask_from_external_knowledge(question)
+
+    sources = list(set(
+        n.metadata.get("chapter")
+        for n in nodes
+        if n.metadata.get("chapter")
+    ))
+
+    sources_text = "\n".join(f"📘 {s}" for s in sources)
+
+    # 🔥 STRICT RAG PROMPT
     prompt = f"""
+You are a strict AI assistant.
+
 Answer ONLY using the context below.
-If the answer is not present, say:
-"I don't know based on the provided document."
+Do NOT use external knowledge.
+
+If answer is not clearly present, say:
+"I don't know based on the provided documents."
 
 Context:
 {context}
 
 Question:
 {question}
+
+Answer:
 """
 
-    try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+    answer = generate_with_retry(prompt)
 
+    # 🔥 If model still unsure → fallback
+    if not answer or "i don't know" in answer.lower():
+        return ask_from_external_knowledge(question)
 
-# ---------- General chat ----------
-def ask_general_question(question):
-    try:
-        model = genai.GenerativeModel(MODEL_NAME)
-        response = model.generate_content(question)
-        return response.text
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+    return f"{answer}\n\n---\n📚 Sources:\n{sources_text}\n\nℹ️ Answer derived from provided documents."
+
+# -------- EXTERNAL KNOWLEDGE FALLBACK --------
+def ask_from_external_knowledge(question):
+    prompt = f"""
+Answer the question clearly using general knowledge.
+
+Question:
+{question}
+
+Answer:
+"""
+
+    answer = generate_with_retry(prompt)
+
+    return f"{answer}\n\n---\n🌍 Source: External Knowledge (No relevant context found)"

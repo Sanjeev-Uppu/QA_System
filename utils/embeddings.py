@@ -1,4 +1,3 @@
-# utils/embeddings.py
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
 def get_embedding_model():
