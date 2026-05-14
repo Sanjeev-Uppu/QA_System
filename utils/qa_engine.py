@@ -9,16 +9,18 @@ from llama_index.core.node_parser import SimpleNodeParser
 from qdrant_client import QdrantClient
 
 from utils.embeddings import get_embedding_model
-from google import genai
+from groq import Groq
 
 # -------- LOAD ENV --------
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+client = Groq(api_key=GROQ_API_KEY)
+ 
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
+ 
 
 # -------- QDRANT CLIENT --------
 def get_qdrant_client():
@@ -64,26 +66,35 @@ def load_documents(folder):
     return documents
 
 # -------- GEMINI RETRY --------
+# -------- GROQ RETRY --------
 def generate_with_retry(prompt):
+
     models = [
-        "models/gemini-2.5-flash",
-        "models/gemini-2.0-flash"
+        "llama-3.3-70b-versatile",
+        "llama3-8b-8192"
     ]
 
     for model in models:
         for _ in range(3):
             try:
-                res = client.models.generate_content(
+                response = client.chat.completions.create(
                     model=model,
-                    contents=prompt
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.3
                 )
-                return res.text
+
+                return response.choices[0].message.content
+
             except Exception as e:
                 print(f"⚠️ {model} failed: {e}")
                 time.sleep(2)
 
     return None
-
 # -------- BUILD INDEX --------
 def build_index():
     print("📄 Loading PDFs...")
@@ -144,11 +155,11 @@ def ask_question(index, question):
             "chunks": []
         }
 
-    retriever = index.as_retriever(similarity_top_k=5)
+    retriever = index.as_retriever(similarity_top_k=5) #retriver = search engine
     nodes = retriever.retrieve(question)
 
     # ❌ No context → fallback
-    if not nodes:
+    if not nodes: 
         ext = ask_from_external_knowledge(question)
         return {
             "answer": ext,
@@ -176,7 +187,8 @@ def ask_question(index, question):
     prompt = f"""
 You are a strict AI assistant.
 
-Answer ONLY using the context below.
+Answer ONLY using the context below in a proper manner according 
+to how question is asked in a structured manner.
 Do NOT use external knowledge.
 
 If answer is not clearly present, say:
